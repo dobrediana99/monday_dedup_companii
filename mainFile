@@ -1,1 +1,1018 @@
-//start
+#!/usr/bin/env python3
+"""
+Safe, deterministic company deduplication for monday.com boards.
+
+Board A (Companies): 1853156756
+Board B (Orders / Transports): 2030349838
+Relations on Board B:
+  - board_relation_mkpw4bcs (Companie Client)
+  - board_relation_mkse9rp2 (Companie Furnizor)
+
+Execution modes:
+  1) dry-run  -> no mutations, produces impact report
+  2) execute  -> migrates relations, verifies, archives duplicates
+
+Usage examples:
+  export MONDAY_API_TOKEN="..."
+  python mainFile --mode dry-run
+  python mainFile --mode execute
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import json
+import os
+import re
+import sys
+import time
+import unicodedata
+import urllib.error
+import urllib.request
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Sequence, Tuple
+
+
+COMPANIES_BOARD_ID = 1853156756
+ORDERS_BOARD_ID = 2030349838
+RELATION_COLUMNS = ("board_relation_mkpw4bcs", "board_relation_mkse9rp2")
+MONDAY_API_URL = "https://api.monday.com/v2"
+
+LEGAL_SUFFIXES = {
+    "SRL",
+    "GMBH",
+    "SPA",
+    "SA",
+    "LTD",
+    "LLC",
+    "INC",
+    "BV",
+    "NV",
+    "PLC",
+    "CO",
+    "COMPANY",
+    "SAS",
+    "SRLS",
+    "KG",
+    "AG",
+    "OY",
+    "AB",
+    "AS",
+    "KFT",
+    "OOO",
+    "SRO",
+    "EURL",
+    "SARL",
+    "SL",
+    "SR",
+}
+
+STATUS_ACTIVE_VALUES = {"ACTIVE"}
+
+
+class MondayApiError(RuntimeError):
+    """Raised when monday.com API calls fail permanently."""
+
+
+class SafetyCheckError(RuntimeError):
+    """Raised when an operation could cause data loss."""
+
+
+@dataclass(frozen=True)
+class ColumnMeta:
+    id: str
+    title: str
+    type: str
+    settings_str: str
+
+
+@dataclass
+class CompanyRecord:
+    id: int
+    name: str
+    created_at: str
+    created_at_dt: dt.datetime
+    column_values: Dict[str, Dict[str, Any]]
+    vat_display: str
+    vat_key: str
+    normalized_name: str
+
+    def display(self, column_id: Optional[str]) -> str:
+        if not column_id:
+            return ""
+        raw = self.column_values.get(column_id, {}).get("display_value")
+        return (raw or "").strip()
+
+
+@dataclass(frozen=True)
+class DuplicateGroup:
+    key_type: str
+    key_value: str
+    canonical_id: int
+    duplicate_ids: Tuple[int, ...]
+    all_ids: Tuple[int, ...]
+
+
+@dataclass(frozen=True)
+class MigrationAction:
+    order_id: int
+    column_id: str
+    from_company_id: int
+    to_company_id: int
+
+
+class MondayClient:
+    def __init__(
+        self,
+        api_token: str,
+        api_url: str = MONDAY_API_URL,
+        max_retries: int = 5,
+        backoff_seconds: float = 1.0,
+        timeout_seconds: float = 60.0,
+    ) -> None:
+        self.api_token = api_token
+        self.api_url = api_url
+        self.max_retries = max_retries
+        self.backoff_seconds = backoff_seconds
+        self.timeout_seconds = timeout_seconds
+
+    def execute(self, query: str, variables: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        payload = {"query": query, "variables": variables or {}}
+        encoded_payload = json.dumps(payload).encode("utf-8")
+        headers = {
+            "Authorization": self.api_token,
+            "Content-Type": "application/json",
+        }
+
+        for attempt in range(self.max_retries + 1):
+            request = urllib.request.Request(
+                self.api_url,
+                data=encoded_payload,
+                headers=headers,
+                method="POST",
+            )
+            try:
+                with urllib.request.urlopen(request, timeout=self.timeout_seconds) as response:
+                    body = response.read().decode("utf-8")
+                    status = response.status
+            except urllib.error.HTTPError as error:
+                body = ""
+                if error.fp is not None:
+                    try:
+                        body = error.read().decode("utf-8")
+                    except Exception:
+                        body = ""
+                if self._retry_http(error.code, attempt):
+                    self._sleep_with_backoff(attempt, None)
+                    continue
+                raise MondayApiError(f"HTTP {error.code} from monday.com: {body or str(error)}") from error
+            except urllib.error.URLError as error:
+                if attempt < self.max_retries:
+                    self._sleep_with_backoff(attempt, None)
+                    continue
+                raise MondayApiError(f"Network error from monday.com: {error}") from error
+
+            if status == 429 or status >= 500:
+                if attempt < self.max_retries:
+                    self._sleep_with_backoff(attempt, None)
+                    continue
+                raise MondayApiError(f"HTTP {status} from monday.com after retries.")
+
+            try:
+                payload_json = json.loads(body)
+            except json.JSONDecodeError as error:
+                if attempt < self.max_retries:
+                    self._sleep_with_backoff(attempt, None)
+                    continue
+                raise MondayApiError(f"Invalid JSON response from monday.com: {body}") from error
+
+            gql_errors = payload_json.get("errors") or []
+            if gql_errors:
+                retry_after = self._extract_retry_after_seconds(gql_errors)
+                if self._retry_graphql(gql_errors, attempt):
+                    self._sleep_with_backoff(attempt, retry_after)
+                    continue
+                raise MondayApiError(f"GraphQL errors from monday.com: {json.dumps(gql_errors, ensure_ascii=True)}")
+
+            return payload_json.get("data") or {}
+
+        raise MondayApiError("monday.com request retries exhausted.")
+
+    def _retry_http(self, http_code: int, attempt: int) -> bool:
+        return http_code in {408, 409, 425, 429} or (http_code >= 500 and attempt < self.max_retries)
+
+    def _retry_graphql(self, errors: List[Dict[str, Any]], attempt: int) -> bool:
+        if attempt >= self.max_retries:
+            return False
+
+        retryable_tokens = (
+            "rate",
+            "limit",
+            "complexity",
+            "timeout",
+            "concurrency",
+            "temporar",
+            "throttl",
+        )
+        for error in errors:
+            message = str(error.get("message", "")).lower()
+            code = str(error.get("extensions", {}).get("code", "")).lower()
+            haystack = f"{message} {code}"
+            if any(token in haystack for token in retryable_tokens):
+                return True
+        return False
+
+    def _extract_retry_after_seconds(self, errors: List[Dict[str, Any]]) -> Optional[float]:
+        for error in errors:
+            extensions = error.get("extensions", {})
+            for key in ("retry_in_seconds", "retry_after", "retryAfter", "retryInSeconds"):
+                value = extensions.get(key)
+                if value is None:
+                    continue
+                try:
+                    parsed = float(value)
+                    if parsed > 0:
+                        return parsed
+                except (TypeError, ValueError):
+                    continue
+        return None
+
+    def _sleep_with_backoff(self, attempt: int, retry_after_seconds: Optional[float]) -> None:
+        if retry_after_seconds is not None:
+            sleep_seconds = retry_after_seconds
+        else:
+            sleep_seconds = self.backoff_seconds * (2 ** attempt)
+        time.sleep(sleep_seconds)
+
+
+BOARD_COLUMNS_QUERY = """
+query BoardColumns($boardId: [ID!]) {
+  boards(ids: $boardId) {
+    id
+    columns {
+      id
+      title
+      type
+      settings_str
+    }
+  }
+}
+"""
+
+FIRST_PAGE_ITEMS_QUERY = """
+query FirstPageItems($boardId: [ID!], $limit: Int!, $columnIds: [String!]) {
+  boards(ids: $boardId) {
+    id
+    items_page(limit: $limit) {
+      cursor
+      items {
+        id
+        name
+        created_at
+        column_values(ids: $columnIds) {
+          id
+          value
+          display_value
+        }
+      }
+    }
+  }
+}
+"""
+
+NEXT_PAGE_ITEMS_QUERY = """
+query NextPageItems($cursor: String!, $limit: Int!, $columnIds: [String!]) {
+  next_items_page(cursor: $cursor, limit: $limit) {
+    cursor
+    items {
+      id
+      name
+      created_at
+      column_values(ids: $columnIds) {
+        id
+        value
+        display_value
+      }
+    }
+  }
+}
+"""
+
+CHANGE_COLUMN_VALUE_MUTATION = """
+mutation ChangeRelation($boardId: ID!, $itemId: ID!, $columnId: String!, $value: JSON!) {
+  change_column_value(
+    board_id: $boardId,
+    item_id: $itemId,
+    column_id: $columnId,
+    value: $value
+  ) {
+    id
+  }
+}
+"""
+
+ARCHIVE_ITEM_MUTATION = """
+mutation ArchiveItem($itemId: ID!) {
+  archive_item(item_id: $itemId) {
+    id
+  }
+}
+"""
+
+
+def remove_diacritics(text: str) -> str:
+    decomposed = unicodedata.normalize("NFKD", text)
+    return "".join(ch for ch in decomposed if not unicodedata.combining(ch))
+
+
+def normalize_company_name(name: str) -> str:
+    ascii_name = remove_diacritics((name or "").upper())
+    ascii_name = re.sub(r"[^A-Z0-9\s]", " ", ascii_name)
+
+    # Normalize dotted/acronym legal suffixes into canonical tokens.
+    canonicalized = re.sub(r"\bS\s*R\s*L\b", " SRL ", ascii_name)
+    canonicalized = re.sub(r"\bL\s*L\s*C\b", " LLC ", canonicalized)
+    canonicalized = re.sub(r"\bL\s*T\s*D\b", " LTD ", canonicalized)
+    canonicalized = re.sub(r"\bS\s*A\b", " SA ", canonicalized)
+
+    tokens = [token for token in canonicalized.split() if token and token not in LEGAL_SUFFIXES]
+    return " ".join(tokens).strip()
+
+
+def normalize_vat(vat_display: str) -> str:
+    return re.sub(r"[^A-Z0-9]", "", remove_diacritics((vat_display or "").upper()))
+
+
+def normalize_title(title: str) -> str:
+    return re.sub(r"\s+", " ", re.sub(r"[^A-Z0-9\s]", " ", remove_diacritics(title.upper()))).strip()
+
+
+def parse_datetime(value: str) -> dt.datetime:
+    raw = (value or "").strip()
+    if not raw:
+        return dt.datetime.max.replace(tzinfo=dt.timezone.utc)
+    if raw.endswith("Z"):
+        raw = raw[:-1] + "+00:00"
+    try:
+        parsed = dt.datetime.fromisoformat(raw)
+    except ValueError:
+        return dt.datetime.max.replace(tzinfo=dt.timezone.utc)
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=dt.timezone.utc)
+    return parsed
+
+
+def compact_json(value: Any) -> str:
+    return json.dumps(value, separators=(",", ":"), ensure_ascii=True)
+
+
+def fetch_board_columns(client: MondayClient, board_id: int) -> List[ColumnMeta]:
+    data = client.execute(BOARD_COLUMNS_QUERY, {"boardId": [str(board_id)]})
+    boards = data.get("boards") or []
+    if not boards:
+        raise MondayApiError(f"Board {board_id} not found.")
+    raw_columns = boards[0].get("columns") or []
+    columns = [
+        ColumnMeta(
+            id=str(col.get("id", "")).strip(),
+            title=str(col.get("title", "")).strip(),
+            type=str(col.get("type", "")).strip(),
+            settings_str=str(col.get("settings_str", "") or ""),
+        )
+        for col in raw_columns
+        if col.get("id")
+    ]
+    return columns
+
+
+def fetch_all_items(
+    client: MondayClient,
+    board_id: int,
+    column_ids: Sequence[str],
+    page_limit: int = 500,
+) -> List[Dict[str, Any]]:
+    variables = {
+        "boardId": [str(board_id)],
+        "limit": page_limit,
+        "columnIds": list(column_ids),
+    }
+    first_page_data = client.execute(FIRST_PAGE_ITEMS_QUERY, variables)
+    boards = first_page_data.get("boards") or []
+    if not boards:
+        raise MondayApiError(f"Board {board_id} not found when fetching items.")
+
+    items_page = boards[0].get("items_page") or {}
+    items = list(items_page.get("items") or [])
+    cursor = items_page.get("cursor")
+
+    while cursor:
+        next_page_data = client.execute(
+            NEXT_PAGE_ITEMS_QUERY,
+            {"cursor": cursor, "limit": page_limit, "columnIds": list(column_ids)},
+        )
+        next_page = next_page_data.get("next_items_page") or {}
+        items.extend(next_page.get("items") or [])
+        cursor = next_page.get("cursor")
+
+    return items
+
+
+def as_column_map(item: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    result: Dict[str, Dict[str, Any]] = {}
+    for column_value in item.get("column_values") or []:
+        column_id = str(column_value.get("id", "")).strip()
+        if not column_id:
+            continue
+        result[column_id] = {
+            "display_value": column_value.get("display_value"),
+            "value": column_value.get("value"),
+        }
+    return result
+
+
+def select_column(
+    columns: Sequence[ColumnMeta],
+    explicit_id: Optional[str],
+    preferred_types: Sequence[str],
+    title_keywords: Sequence[str],
+) -> Optional[str]:
+    by_id = {col.id: col for col in columns}
+    if explicit_id:
+        if explicit_id not in by_id:
+            raise SafetyCheckError(f"Configured column '{explicit_id}' not found.")
+        return explicit_id
+
+    def has_keyword(col: ColumnMeta) -> bool:
+        title = normalize_title(col.title)
+        return any(keyword in title for keyword in title_keywords)
+
+    preferred_types_set = {x.lower() for x in preferred_types}
+    sorted_columns = sorted(columns, key=lambda c: (c.id, c.title))
+
+    for col in sorted_columns:
+        if col.type.lower() in preferred_types_set and has_keyword(col):
+            return col.id
+    for col in sorted_columns:
+        if has_keyword(col):
+            return col.id
+    for col in sorted_columns:
+        if col.type.lower() in preferred_types_set:
+            return col.id
+    return None
+
+
+def resolve_company_columns(
+    columns: Sequence[ColumnMeta],
+    vat_column_id: Optional[str],
+    country_column_id: Optional[str],
+    email_column_id: Optional[str],
+    address_column_id: Optional[str],
+    status_column_id: Optional[str],
+) -> Dict[str, Optional[str]]:
+    vat_id = select_column(
+        columns,
+        vat_column_id,
+        preferred_types=("text", "numbers", "numeric", "phone"),
+        title_keywords=("VAT", "CUI", "TAX", "FISCAL", "TVA"),
+    )
+    country_id = select_column(
+        columns,
+        country_column_id,
+        preferred_types=("country",),
+        title_keywords=("COUNTRY", "TARA", "ȚARA"),
+    )
+    email_id = select_column(
+        columns,
+        email_column_id,
+        preferred_types=("email",),
+        title_keywords=("EMAIL", "E MAIL"),
+    )
+    address_id = select_column(
+        columns,
+        address_column_id,
+        preferred_types=("location", "long_text", "text"),
+        title_keywords=("ADDRESS", "ADRESA", "ADRESS"),
+    )
+    status_id = select_column(
+        columns,
+        status_column_id,
+        preferred_types=("status",),
+        title_keywords=("STATUS", "STARE"),
+    )
+    return {
+        "vat": vat_id,
+        "country": country_id,
+        "email": email_id,
+        "address": address_id,
+        "status": status_id,
+    }
+
+
+def company_from_item(item: Dict[str, Any], company_columns: Dict[str, Optional[str]]) -> CompanyRecord:
+    column_map = as_column_map(item)
+    item_id = int(str(item.get("id", "0")))
+    name = str(item.get("name", "")).strip()
+    created_at = str(item.get("created_at", "")).strip()
+
+    vat_column = company_columns.get("vat")
+    vat_display = (column_map.get(vat_column, {}).get("display_value") or "").strip() if vat_column else ""
+    vat_key = normalize_vat(vat_display)
+
+    normalized_name = normalize_company_name(name)
+
+    return CompanyRecord(
+        id=item_id,
+        name=name,
+        created_at=created_at,
+        created_at_dt=parse_datetime(created_at),
+        column_values=column_map,
+        vat_display=vat_display,
+        vat_key=vat_key,
+        normalized_name=normalized_name,
+    )
+
+
+def company_score(record: CompanyRecord, company_columns: Dict[str, Optional[str]]) -> int:
+    score = 0
+    if record.vat_display:
+        score += 2
+    if record.display(company_columns.get("country")):
+        score += 1
+    if record.display(company_columns.get("email")):
+        score += 1
+    if record.display(company_columns.get("address")):
+        score += 1
+
+    status_value = record.display(company_columns.get("status")).upper()
+    if status_value in STATUS_ACTIVE_VALUES:
+        score += 1
+    return score
+
+
+def select_canonical(records: Sequence[CompanyRecord], company_columns: Dict[str, Optional[str]]) -> CompanyRecord:
+    def sort_key(record: CompanyRecord) -> Tuple[int, dt.datetime, int]:
+        return (-company_score(record, company_columns), record.created_at_dt, record.id)
+
+    return sorted(records, key=sort_key)[0]
+
+
+def build_duplicate_groups(
+    companies: Sequence[CompanyRecord],
+    company_columns: Dict[str, Optional[str]],
+) -> List[DuplicateGroup]:
+    vat_groups: Dict[str, List[CompanyRecord]] = {}
+    name_groups: Dict[str, List[CompanyRecord]] = {}
+
+    for company in companies:
+        if company.vat_key:
+            vat_groups.setdefault(company.vat_key, []).append(company)
+            continue
+        if company.normalized_name:
+            name_groups.setdefault(company.normalized_name, []).append(company)
+
+    groups: List[DuplicateGroup] = []
+
+    for vat_key, records in vat_groups.items():
+        if len(records) < 2:
+            continue
+        canonical = select_canonical(records, company_columns)
+        duplicate_ids = tuple(sorted(record.id for record in records if record.id != canonical.id))
+        if not duplicate_ids:
+            continue
+        all_ids = tuple(sorted(record.id for record in records))
+        groups.append(
+            DuplicateGroup(
+                key_type="VAT",
+                key_value=vat_key,
+                canonical_id=canonical.id,
+                duplicate_ids=duplicate_ids,
+                all_ids=all_ids,
+            )
+        )
+
+    for normalized_name, records in name_groups.items():
+        if len(records) < 2:
+            continue
+        canonical = select_canonical(records, company_columns)
+        duplicate_ids = tuple(sorted(record.id for record in records if record.id != canonical.id))
+        if not duplicate_ids:
+            continue
+        all_ids = tuple(sorted(record.id for record in records))
+        groups.append(
+            DuplicateGroup(
+                key_type="NAME",
+                key_value=normalized_name,
+                canonical_id=canonical.id,
+                duplicate_ids=duplicate_ids,
+                all_ids=all_ids,
+            )
+        )
+
+    return sorted(groups, key=lambda group: (group.key_type, group.key_value, group.canonical_id))
+
+
+def parse_relation_ids(raw_value: Optional[str], context: str) -> List[int]:
+    if not raw_value:
+        return []
+    try:
+        parsed = json.loads(raw_value)
+    except json.JSONDecodeError as error:
+        raise SafetyCheckError(
+            f"Failed to parse relation JSON for {context}. Raw value: {raw_value}"
+        ) from error
+
+    linked = parsed.get("linkedPulseIds")
+    if linked is None:
+        linked = parsed.get("item_ids")
+    if linked is None:
+        return []
+
+    result: List[int] = []
+    if isinstance(linked, list):
+        for entry in linked:
+            if isinstance(entry, dict):
+                raw_id = entry.get("linkedPulseId")
+                if raw_id is None:
+                    raw_id = entry.get("linkedPulseID")
+                if raw_id is None:
+                    raw_id = entry.get("id")
+            else:
+                raw_id = entry
+            if raw_id is None:
+                continue
+            try:
+                result.append(int(str(raw_id)))
+            except ValueError:
+                continue
+    return result
+
+
+def check_relation_columns_are_single_select(order_columns: Sequence[ColumnMeta]) -> None:
+    by_id = {column.id: column for column in order_columns}
+    for column_id in RELATION_COLUMNS:
+        column = by_id.get(column_id)
+        if column is None:
+            raise SafetyCheckError(f"Required relation column '{column_id}' not found on orders board.")
+        settings_raw = column.settings_str or "{}"
+        try:
+            settings = json.loads(settings_raw)
+        except json.JSONDecodeError:
+            settings = {}
+        allow_multiple = settings.get("allowMultipleItems")
+        if allow_multiple is True:
+            raise SafetyCheckError(
+                f"Column '{column_id}' has allowMultipleItems=true. Script requires single-select relations."
+            )
+
+
+def plan_relation_migration(
+    order_items: Sequence[Dict[str, Any]],
+    duplicate_to_canonical: Dict[int, int],
+) -> Tuple[List[MigrationAction], Dict[int, List[int]]]:
+    actions: List[MigrationAction] = []
+    affected_orders_by_duplicate: Dict[int, List[int]] = {}
+
+    for item in order_items:
+        order_id = int(str(item.get("id", "0")))
+        order_columns = as_column_map(item)
+        for column_id in RELATION_COLUMNS:
+            relation_raw = order_columns.get(column_id, {}).get("value")
+            relation_ids = parse_relation_ids(
+                relation_raw,
+                context=f"order {order_id} / column {column_id}",
+            )
+            if len(relation_ids) > 1:
+                raise SafetyCheckError(
+                    f"Order {order_id} / column {column_id} contains multiple linked items ({relation_ids}), "
+                    "but relation is expected to be single-select."
+                )
+            if not relation_ids:
+                continue
+
+            current_company_id = relation_ids[0]
+            canonical_company_id = duplicate_to_canonical.get(current_company_id)
+            if canonical_company_id is None:
+                continue
+            if canonical_company_id == current_company_id:
+                continue
+
+            actions.append(
+                MigrationAction(
+                    order_id=order_id,
+                    column_id=column_id,
+                    from_company_id=current_company_id,
+                    to_company_id=canonical_company_id,
+                )
+            )
+            affected_orders_by_duplicate.setdefault(current_company_id, [])
+            affected_orders_by_duplicate[current_company_id].append(order_id)
+
+    actions.sort(key=lambda action: (action.order_id, action.column_id, action.from_company_id, action.to_company_id))
+    for duplicate_id, order_ids in affected_orders_by_duplicate.items():
+        unique_sorted_ids = sorted(set(order_ids))
+        affected_orders_by_duplicate[duplicate_id] = unique_sorted_ids
+    return actions, affected_orders_by_duplicate
+
+
+def execute_relation_updates(
+    client: MondayClient,
+    actions: Sequence[MigrationAction],
+    orders_board_id: int,
+) -> List[Dict[str, Any]]:
+    applied: List[Dict[str, Any]] = []
+    for action in actions:
+        mutation_value = compact_json({"linkedPulseIds": [{"linkedPulseId": action.to_company_id}]})
+        variables = {
+            "boardId": str(orders_board_id),
+            "itemId": str(action.order_id),
+            "columnId": action.column_id,
+            "value": mutation_value,
+        }
+        client.execute(CHANGE_COLUMN_VALUE_MUTATION, variables)
+        applied.append(
+            {
+                "order_id": action.order_id,
+                "column_id": action.column_id,
+                "from_company_id": action.from_company_id,
+                "to_company_id": action.to_company_id,
+            }
+        )
+    return applied
+
+
+def verify_no_duplicate_references(
+    order_items: Sequence[Dict[str, Any]],
+    duplicate_ids: Sequence[int],
+) -> List[Dict[str, Any]]:
+    duplicate_id_set = set(duplicate_ids)
+    leftovers: List[Dict[str, Any]] = []
+
+    for item in order_items:
+        order_id = int(str(item.get("id", "0")))
+        order_columns = as_column_map(item)
+        for column_id in RELATION_COLUMNS:
+            relation_raw = order_columns.get(column_id, {}).get("value")
+            relation_ids = parse_relation_ids(
+                relation_raw,
+                context=f"verification order {order_id} / column {column_id}",
+            )
+            for relation_id in relation_ids:
+                if relation_id in duplicate_id_set:
+                    leftovers.append(
+                        {
+                            "order_id": order_id,
+                            "column_id": column_id,
+                            "duplicate_id": relation_id,
+                        }
+                    )
+    leftovers.sort(key=lambda row: (row["order_id"], row["column_id"], row["duplicate_id"]))
+    return leftovers
+
+
+def archive_duplicates(client: MondayClient, duplicate_ids: Sequence[int]) -> List[int]:
+    archived: List[int] = []
+    for duplicate_id in sorted(set(duplicate_ids)):
+        client.execute(ARCHIVE_ITEM_MUTATION, {"itemId": str(duplicate_id)})
+        archived.append(duplicate_id)
+    return archived
+
+
+def build_duplicate_map(groups: Sequence[DuplicateGroup]) -> Dict[int, int]:
+    duplicate_to_canonical: Dict[int, int] = {}
+    for group in groups:
+        for duplicate_id in group.duplicate_ids:
+            duplicate_to_canonical[duplicate_id] = group.canonical_id
+    return duplicate_to_canonical
+
+
+def safe_get(record: CompanyRecord, column_id: Optional[str]) -> str:
+    return record.display(column_id) if column_id else ""
+
+
+def build_company_index(companies: Sequence[CompanyRecord]) -> Dict[int, CompanyRecord]:
+    return {company.id: company for company in companies}
+
+
+def score_snapshot(record: CompanyRecord, company_columns: Dict[str, Optional[str]]) -> Dict[str, Any]:
+    return {
+        "company_id": record.id,
+        "name": record.name,
+        "score": company_score(record, company_columns),
+        "vat": record.vat_display,
+        "country": safe_get(record, company_columns.get("country")),
+        "email": safe_get(record, company_columns.get("email")),
+        "address": safe_get(record, company_columns.get("address")),
+        "status": safe_get(record, company_columns.get("status")),
+        "created_at": record.created_at,
+    }
+
+
+def run(args: argparse.Namespace) -> Dict[str, Any]:
+    token = args.api_token or os.getenv("MONDAY_API_TOKEN")
+    if not token:
+        raise SafetyCheckError("Missing monday.com API token. Use --api-token or MONDAY_API_TOKEN environment variable.")
+
+    client = MondayClient(
+        api_token=token,
+        api_url=args.api_url,
+        max_retries=args.max_retries,
+        backoff_seconds=args.backoff_seconds,
+        timeout_seconds=args.timeout_seconds,
+    )
+
+    report: Dict[str, Any] = {
+        "mode": args.mode,
+        "timestamp_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
+        "boards": {
+            "companies_board_id": args.companies_board_id,
+            "orders_board_id": args.orders_board_id,
+        },
+        "relation_columns": list(RELATION_COLUMNS),
+        "assumptions": {
+            "single_select_relations_required": True,
+            "read_human_values_from_display_value": True,
+            "update_relations_with_linkedPulseIds_json_string": True,
+        },
+    }
+
+    company_columns_meta = fetch_board_columns(client, args.companies_board_id)
+    order_columns_meta = fetch_board_columns(client, args.orders_board_id)
+    check_relation_columns_are_single_select(order_columns_meta)
+
+    company_columns = resolve_company_columns(
+        columns=company_columns_meta,
+        vat_column_id=args.vat_column_id,
+        country_column_id=args.country_column_id,
+        email_column_id=args.email_column_id,
+        address_column_id=args.address_column_id,
+        status_column_id=args.status_column_id,
+    )
+    report["selected_company_columns"] = company_columns
+
+    company_column_ids_to_fetch = sorted({column_id for column_id in company_columns.values() if column_id})
+    company_items_raw = fetch_all_items(
+        client=client,
+        board_id=args.companies_board_id,
+        column_ids=company_column_ids_to_fetch,
+        page_limit=args.page_limit,
+    )
+    companies = [company_from_item(item, company_columns) for item in company_items_raw]
+    company_by_id = build_company_index(companies)
+
+    duplicate_groups = build_duplicate_groups(companies, company_columns)
+    duplicate_to_canonical = build_duplicate_map(duplicate_groups)
+    duplicate_ids = sorted(duplicate_to_canonical.keys())
+
+    report["duplicate_groups"] = [
+        {
+            "key_type": group.key_type,
+            "key_value": group.key_value,
+            "canonical_id": group.canonical_id,
+            "duplicate_ids": list(group.duplicate_ids),
+            "all_ids": list(group.all_ids),
+            "candidates": [
+                score_snapshot(company_by_id[item_id], company_columns)
+                for item_id in sorted(group.all_ids)
+                if item_id in company_by_id
+            ],
+        }
+        for group in duplicate_groups
+    ]
+
+    order_items_raw = fetch_all_items(
+        client=client,
+        board_id=args.orders_board_id,
+        column_ids=list(RELATION_COLUMNS),
+        page_limit=args.page_limit,
+    )
+    migration_actions, affected_orders_by_duplicate = plan_relation_migration(order_items_raw, duplicate_to_canonical)
+
+    dry_run_rows = []
+    for duplicate_id in duplicate_ids:
+        order_ids = affected_orders_by_duplicate.get(duplicate_id, [])
+        dry_run_rows.append(
+            {
+                "duplicate_id": duplicate_id,
+                "canonical_id": duplicate_to_canonical[duplicate_id],
+                "affected_orders_count": len(order_ids),
+                "affected_order_ids": order_ids,
+            }
+        )
+    report["dry_run_impacts"] = dry_run_rows
+    report["planned_relation_updates_count"] = len(migration_actions)
+    report["planned_relation_updates"] = [
+        {
+            "order_id": action.order_id,
+            "column_id": action.column_id,
+            "from_company_id": action.from_company_id,
+            "to_company_id": action.to_company_id,
+        }
+        for action in migration_actions
+    ]
+
+    if args.mode == "dry-run":
+        report["verification"] = {
+            "performed": False,
+            "passed": None,
+            "remaining_references": [],
+        }
+        report["archived_duplicates"] = []
+        report["summary"] = {
+            "duplicate_groups_count": len(duplicate_groups),
+            "duplicate_items_count": len(duplicate_ids),
+            "orders_to_update_count": len(migration_actions),
+            "mutations_executed": 0,
+            "archives_executed": 0,
+        }
+        return report
+
+    # EXECUTION MODE
+    relation_update_log = execute_relation_updates(
+        client=client,
+        actions=migration_actions,
+        orders_board_id=args.orders_board_id,
+    )
+    report["executed_relation_updates"] = relation_update_log
+
+    verification_scan = fetch_all_items(
+        client=client,
+        board_id=args.orders_board_id,
+        column_ids=list(RELATION_COLUMNS),
+        page_limit=args.page_limit,
+    )
+    remaining_references = verify_no_duplicate_references(verification_scan, duplicate_ids)
+    report["verification"] = {
+        "performed": True,
+        "passed": len(remaining_references) == 0,
+        "remaining_references": remaining_references,
+    }
+    if remaining_references:
+        raise SafetyCheckError(
+            "Verification failed: duplicate references still exist in orders board. "
+            "Archiving is blocked to prevent relation loss."
+        )
+
+    archived_duplicates = []
+    if args.archive_duplicates:
+        archived_duplicates = archive_duplicates(client, duplicate_ids)
+    report["archived_duplicates"] = archived_duplicates
+    report["summary"] = {
+        "duplicate_groups_count": len(duplicate_groups),
+        "duplicate_items_count": len(duplicate_ids),
+        "orders_to_update_count": len(migration_actions),
+        "mutations_executed": len(relation_update_log),
+        "archives_executed": len(archived_duplicates),
+    }
+    return report
+
+
+def build_arg_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Safe and deterministic monday.com company deduplication.")
+    parser.add_argument("--mode", choices=("dry-run", "execute"), default="dry-run")
+    parser.add_argument("--api-token", default=None, help="monday.com API token (or MONDAY_API_TOKEN env var).")
+    parser.add_argument("--api-url", default=MONDAY_API_URL)
+
+    parser.add_argument("--companies-board-id", type=int, default=COMPANIES_BOARD_ID)
+    parser.add_argument("--orders-board-id", type=int, default=ORDERS_BOARD_ID)
+
+    parser.add_argument("--vat-column-id", default=None, help="Optional explicit VAT column id on Companies board.")
+    parser.add_argument("--country-column-id", default=None, help="Optional explicit country column id.")
+    parser.add_argument("--email-column-id", default=None, help="Optional explicit email column id.")
+    parser.add_argument("--address-column-id", default=None, help="Optional explicit address column id.")
+    parser.add_argument("--status-column-id", default=None, help="Optional explicit status column id.")
+
+    parser.add_argument("--page-limit", type=int, default=500)
+    parser.add_argument("--max-retries", type=int, default=5)
+    parser.add_argument("--backoff-seconds", type=float, default=1.0)
+    parser.add_argument("--timeout-seconds", type=float, default=60.0)
+
+    parser.add_argument(
+        "--archive-duplicates",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Archive duplicates after verification in execute mode.",
+    )
+    return parser
+
+
+def main() -> int:
+    parser = build_arg_parser()
+    args = parser.parse_args()
+    try:
+        report = run(args)
+        print(json.dumps(report, indent=2, ensure_ascii=True))
+        return 0
+    except (MondayApiError, SafetyCheckError) as error:
+        error_report = {
+            "mode": args.mode,
+            "timestamp_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
+            "error_type": error.__class__.__name__,
+            "error_message": str(error),
+        }
+        print(json.dumps(error_report, indent=2, ensure_ascii=True), file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())
