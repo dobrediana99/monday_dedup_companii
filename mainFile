@@ -848,6 +848,12 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
         address_column_id=args.address_column_id,
         status_column_id=args.status_column_id,
     )
+    if not company_columns.get("vat") and not args.allow_missing_vat_column:
+        raise SafetyCheckError(
+            "VAT column could not be resolved safely. "
+            "Provide --vat-column-id explicitly, or pass --allow-missing-vat-column "
+            "to force name-only deduplication."
+        )
     report["selected_company_columns"] = company_columns
 
     company_column_ids_to_fetch = sorted({column_id for column_id in company_columns.values() if column_id})
@@ -981,6 +987,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--email-column-id", default=None, help="Optional explicit email column id.")
     parser.add_argument("--address-column-id", default=None, help="Optional explicit address column id.")
     parser.add_argument("--status-column-id", default=None, help="Optional explicit status column id.")
+    parser.add_argument(
+        "--allow-missing-vat-column",
+        action="store_true",
+        help="Allow name-only dedup when VAT column cannot be resolved. Disabled by default for safety.",
+    )
 
     parser.add_argument("--page-limit", type=int, default=500)
     parser.add_argument("--max-retries", type=int, default=5)
