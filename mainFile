@@ -101,7 +101,7 @@ class CompanyRecord:
     def display(self, column_id: Optional[str]) -> str:
         if not column_id:
             return ""
-        raw = self.column_values.get(column_id, {}).get("display_value")
+        raw = self.column_values.get(column_id, {}).get("text")
         return (raw or "").strip()
 
 
@@ -273,7 +273,7 @@ query FirstPageItems($boardId: [ID!], $limit: Int!, $columnIds: [String!]) {
         column_values(ids: $columnIds) {
           id
           value
-          display_value
+          text
         }
       }
     }
@@ -292,7 +292,7 @@ query NextPageItems($cursor: String!, $limit: Int!, $columnIds: [String!]) {
       column_values(ids: $columnIds) {
         id
         value
-        display_value
+        text
       }
     }
   }
@@ -425,7 +425,7 @@ def as_column_map(item: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
         if not column_id:
             continue
         result[column_id] = {
-            "display_value": column_value.get("display_value"),
+            "text": column_value.get("text"),
             "value": column_value.get("value"),
         }
     return result
@@ -516,7 +516,7 @@ def company_from_item(item: Dict[str, Any], company_columns: Dict[str, Optional[
     created_at = str(item.get("created_at", "")).strip()
 
     vat_column = company_columns.get("vat")
-    vat_display = (column_map.get(vat_column, {}).get("display_value") or "").strip() if vat_column else ""
+    vat_display = (column_map.get(vat_column, {}).get("text") or "").strip() if vat_column else ""
     vat_key = normalize_vat(vat_display)
 
     normalized_name = normalize_company_name(name)
@@ -831,7 +831,7 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
         "relation_columns": list(RELATION_COLUMNS),
         "assumptions": {
             "single_select_relations_required": True,
-            "read_human_values_from_display_value": True,
+            "read_human_values_from_text": True,
             "update_relations_with_linkedPulseIds_json_string": True,
         },
     }
