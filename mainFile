@@ -272,8 +272,12 @@ query FirstPageItems($boardId: [ID!], $limit: Int!, $columnIds: [String!]) {
         created_at
         column_values(ids: $columnIds) {
           id
+          type
           value
           text
+          ... on BoardRelationValue {
+            linked_item_ids
+          }
         }
       }
     }
@@ -291,8 +295,12 @@ query NextPageItems($cursor: String!, $limit: Int!, $columnIds: [String!]) {
       created_at
       column_values(ids: $columnIds) {
         id
+        type
         value
         text
+        ... on BoardRelationValue {
+          linked_item_ids
+        }
       }
     }
   }
@@ -420,13 +428,15 @@ def fetch_all_items(
 
 def as_column_map(item: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
     result: Dict[str, Dict[str, Any]] = {}
-    for column_value in item.get("column_values") or []:
-        column_id = str(column_value.get("id", "")).strip()
+    for cv in item.get("column_values") or []:
+        column_id = str(cv.get("id", "")).strip()
         if not column_id:
             continue
         result[column_id] = {
-            "text": column_value.get("text"),
-            "value": column_value.get("value"),
+            "text": cv.get("text"),  # <-- CHEIA PE CARE O FOLOSEȘTE RESTUL CODULUI
+            "value": cv.get("value"),
+            "type": cv.get("type"),
+            "linked_item_ids": cv.get("linked_item_ids") or [],
         }
     return result
 
@@ -516,7 +526,7 @@ def company_from_item(item: Dict[str, Any], company_columns: Dict[str, Optional[
     created_at = str(item.get("created_at", "")).strip()
 
     vat_column = company_columns.get("vat")
-    vat_display = (column_map.get(vat_column, {}).get("text") or "").strip() if vat_column else ""
+    vat_display = (column_map.get(vat_column, {}).get("text") or "").strip()
     vat_key = normalize_vat(vat_display)
 
     normalized_name = normalize_company_name(name)
@@ -677,11 +687,9 @@ def plan_relation_migration(
         order_id = int(str(item.get("id", "0")))
         order_columns = as_column_map(item)
         for column_id in RELATION_COLUMNS:
-            relation_raw = order_columns.get(column_id, {}).get("value")
-            relation_ids = parse_relation_ids(
-                relation_raw,
-                context=f"order {order_id} / column {column_id}",
-            )
+            col = order_columns.get(column_id, {})
+            relation_ids_raw = col.get("linked_item_ids") or []
+            relation_ids = [int(x) for x in relation_ids_raw if str(x).isdigit()]
             if len(relation_ids) > 1:
                 raise SafetyCheckError(
                     f"Order {order_id} / column {column_id} contains multiple linked items ({relation_ids}), "
@@ -752,11 +760,9 @@ def verify_no_duplicate_references(
         order_id = int(str(item.get("id", "0")))
         order_columns = as_column_map(item)
         for column_id in RELATION_COLUMNS:
-            relation_raw = order_columns.get(column_id, {}).get("value")
-            relation_ids = parse_relation_ids(
-                relation_raw,
-                context=f"verification order {order_id} / column {column_id}",
-            )
+            col = order_columns.get(column_id, {})
+            relation_ids_raw = col.get("linked_item_ids") or []
+            relation_ids = [int(x) for x in relation_ids_raw if str(x).isdigit()]
             for relation_id in relation_ids:
                 if relation_id in duplicate_id_set:
                     leftovers.append(
@@ -856,7 +862,8 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
         )
     report["selected_company_columns"] = company_columns
 
-    company_column_ids_to_fetch = sorted({column_id for column_id in company_columns.values() if column_id})
+    company_column_ids_to_fetch = sorted({cid for cid in company_columns.values() if cid})
+    company_column_ids_to_fetch = sorted(set(company_column_ids_to_fetch + ["text_mknrvv8q"]))
     company_items_raw = fetch_all_items(
         client=client,
         board_id=args.companies_board_id,
