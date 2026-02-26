@@ -4,6 +4,8 @@ Safe, deterministic company deduplication for monday.com boards.
 
 Board A (Companies): 1853156756
 Board B (Orders / Transports): 2030349838
+Board C (Contacts): 1853156713
+
 Relations on Board B:
   - board_relation_mkpw4bcs (Companie Client)
   - board_relation_mkse9rp2 (Companie Furnizor)
@@ -14,8 +16,8 @@ Execution modes:
 
 Usage examples:
   export MONDAY_API_TOKEN="..."
-  python mainFile --mode dry-run
-  python mainFile --mode execute
+  python monday_dedup_companii.py --mode dry-run
+  python monday_dedup_companii.py --mode execute
 """
 
 from __future__ import annotations
@@ -36,6 +38,13 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 COMPANIES_BOARD_ID = 1853156756
 ORDERS_BOARD_ID = 2030349838
+CONTACTS_BOARD_ID = 1853156713
+
+COMPANIES_VAT_COLUMN_ID = "text_mknrvv8q"
+COMPANIES_EMAIL_COLUMN_ID = "email_mkq9wa9b"
+COMPANIES_CONTACTS_RELATION_COLUMN_ID = "board_relation_mkpdn5kt"
+CONTACT_PHONE_COLUMN_ID = "contact_phone"
+
 RELATION_COLUMNS = ("board_relation_mkpw4bcs", "board_relation_mkse9rp2")
 MONDAY_API_URL = "https://api.monday.com/v2"
 
@@ -68,8 +77,6 @@ LEGAL_SUFFIXES = {
     "SR",
 }
 
-STATUS_ACTIVE_VALUES = {"ACTIVE"}
-
 
 class MondayApiError(RuntimeError):
     """Raised when monday.com API calls fail permanently."""
@@ -77,6 +84,27 @@ class MondayApiError(RuntimeError):
 
 class SafetyCheckError(RuntimeError):
     """Raised when an operation could cause data loss."""
+
+
+class UnionFind:
+    """Disjoint Set for clustering overlapping company keys deterministically."""
+    def __init__(self) -> None:
+        self.parent: Dict[int, int] = {}
+
+    def find(self, i: int) -> int:
+        if self.parent.setdefault(i, i) != i:
+            self.parent[i] = self.find(self.parent[i])
+        return self.parent[i]
+
+    def union(self, i: int, j: int) -> None:
+        root_i = self.find(i)
+        root_j = self.find(j)
+        if root_i != root_j:
+            # Deterministic: make the smaller root the parent
+            if root_i < root_j:
+                self.parent[root_j] = root_i
+            else:
+                self.parent[root_i] = root_j
 
 
 @dataclass(frozen=True)
@@ -96,19 +124,18 @@ class CompanyRecord:
     column_values: Dict[str, Dict[str, Any]]
     vat_display: str
     vat_key: str
+    email_display: str
+    email_keys: Tuple[str, ...]
+    contact_ids: Tuple[int, ...]
+    phone_source_contact_id: Optional[int]
+    phone_display: str
+    phone_key: str
     normalized_name: str
-
-    def display(self, column_id: Optional[str]) -> str:
-        if not column_id:
-            return ""
-        raw = self.column_values.get(column_id, {}).get("text")
-        return (raw or "").strip()
 
 
 @dataclass(frozen=True)
 class DuplicateGroup:
-    key_type: str
-    key_value: str
+    matched_keys: Tuple[str, ...]
     canonical_id: int
     duplicate_ids: Tuple[int, ...]
     all_ids: Tuple[int, ...]
@@ -352,8 +379,76 @@ def normalize_vat(vat_display: str) -> str:
     return re.sub(r"[^A-Z0-9]", "", remove_diacritics((vat_display or "").upper()))
 
 
-def normalize_title(title: str) -> str:
-    return re.sub(r"\s+", " ", re.sub(r"[^A-Z0-9\s]", " ", remove_diacritics(title.upper()))).strip()
+def normalize_emails(email_display: str) -> List[str]:
+    if not email_display:
+        return []
+    parts = re.split(r'[,;\s]+', email_display)
+    valid_emails = []
+    for p in parts:
+        p = p.strip().lower()
+        if p and "@" in p and "." in p:
+            valid_emails.append(p)
+    return sorted(list(set(valid_emails)))
+
+
+def normalize_phone(phone_display: str) -> str:
+    raw = (phone_display or "").strip()
+    if not raw:
+        return ""
+    has_plus = raw.startswith("+")
+    digits = re.sub(r"\D", "", raw)
+    if not digits:
+        return ""
+    return f"+{digits}" if has_plus else digits
+
+
+def extract_phone_from_column(col_data: Dict[str, Any]) -> str:
+    """Robust fallback: try parsing phone from 'text' first, then 'value' JSON payload."""
+    text = (col_data.get("text") or "").strip()
+    if text:
+        return text
+
+    val_str = (col_data.get("value") or "").strip()
+    if not val_str:
+        return ""
+
+    try:
+        val_json = json.loads(val_str)
+        if isinstance(val_json, dict):
+            for key in ["phone", "text", "value"]:
+                if key in val_json and isinstance(val_json[key], (str, int)):
+                    return str(val_json[key])
+            for v in val_json.values():
+                if isinstance(v, str) and re.search(r"\d{4,}", v):
+                    return v
+        elif isinstance(val_json, list) and val_json:
+            if isinstance(val_json[0], (str, int)):
+                return str(val_json[0])
+    except json.JSONDecodeError:
+        pass
+
+    return ""
+
+
+def select_best_phone(phones: List[Tuple[int, str, str]]) -> Optional[Tuple[int, str, str]]:
+    """
+    phones: List of (contact_id, display_phone, normalized_phone)
+    Returns canonical phone based on deterministic rules:
+      1. Has '+' prefix
+      2. Longest digit count
+      3. Lexicographically smallest string
+    """
+    valid_phones = [p for p in phones if p[2]]
+    if not valid_phones:
+        return None
+
+    def sort_key(p: Tuple[int, str, str]) -> Tuple[int, int, str]:
+        norm_key = p[2]
+        has_plus = 0 if norm_key.startswith("+") else 1  # 0 first (True), 1 later (False)
+        digit_count = -len(re.sub(r"\D", "", norm_key))  # Smaller negative number first (longer)
+        return (has_plus, digit_count, norm_key)         # String ascending as tie-breaker
+
+    return sorted(valid_phones, key=sort_key)[0]
 
 
 def parse_datetime(value: str) -> dt.datetime:
@@ -433,7 +528,7 @@ def as_column_map(item: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
         if not column_id:
             continue
         result[column_id] = {
-            "text": cv.get("text"),  # <-- CHEIA PE CARE O FOLOSEȘTE RESTUL CODULUI
+            "text": cv.get("text"),  # Strict string reading used in standard logic
             "value": cv.get("value"),
             "type": cv.get("type"),
             "linked_item_ids": cv.get("linked_item_ids") or [],
@@ -441,93 +536,36 @@ def as_column_map(item: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
     return result
 
 
-def select_column(
-    columns: Sequence[ColumnMeta],
-    explicit_id: Optional[str],
-    preferred_types: Sequence[str],
-    title_keywords: Sequence[str],
-) -> Optional[str]:
-    by_id = {col.id: col for col in columns}
-    if explicit_id:
-        if explicit_id not in by_id:
-            raise SafetyCheckError(f"Configured column '{explicit_id}' not found.")
-        return explicit_id
-
-    def has_keyword(col: ColumnMeta) -> bool:
-        title = normalize_title(col.title)
-        return any(keyword in title for keyword in title_keywords)
-
-    preferred_types_set = {x.lower() for x in preferred_types}
-    sorted_columns = sorted(columns, key=lambda c: (c.id, c.title))
-
-    for col in sorted_columns:
-        if col.type.lower() in preferred_types_set and has_keyword(col):
-            return col.id
-    for col in sorted_columns:
-        if has_keyword(col):
-            return col.id
-    for col in sorted_columns:
-        if col.type.lower() in preferred_types_set:
-            return col.id
-    return None
-
-
-def resolve_company_columns(
-    columns: Sequence[ColumnMeta],
-    vat_column_id: Optional[str],
-    country_column_id: Optional[str],
-    email_column_id: Optional[str],
-    address_column_id: Optional[str],
-    status_column_id: Optional[str],
-) -> Dict[str, Optional[str]]:
-    vat_id = select_column(
-        columns,
-        vat_column_id,
-        preferred_types=("text", "numbers", "numeric", "phone"),
-        title_keywords=("VAT", "CUI", "TAX", "FISCAL", "TVA"),
-    )
-    country_id = select_column(
-        columns,
-        country_column_id,
-        preferred_types=("country",),
-        title_keywords=("COUNTRY", "TARA", "ȚARA"),
-    )
-    email_id = select_column(
-        columns,
-        email_column_id,
-        preferred_types=("email",),
-        title_keywords=("EMAIL", "E MAIL"),
-    )
-    address_id = select_column(
-        columns,
-        address_column_id,
-        preferred_types=("location", "long_text", "text"),
-        title_keywords=("ADDRESS", "ADRESA", "ADRESS"),
-    )
-    status_id = select_column(
-        columns,
-        status_column_id,
-        preferred_types=("status",),
-        title_keywords=("STATUS", "STARE"),
-    )
-    return {
-        "vat": vat_id,
-        "country": country_id,
-        "email": email_id,
-        "address": address_id,
-        "status": status_id,
-    }
-
-
-def company_from_item(item: Dict[str, Any], company_columns: Dict[str, Optional[str]]) -> CompanyRecord:
+def company_from_item(item: Dict[str, Any], contact_phones: Dict[int, str]) -> CompanyRecord:
     column_map = as_column_map(item)
     item_id = int(str(item.get("id", "0")))
     name = str(item.get("name", "")).strip()
     created_at = str(item.get("created_at", "")).strip()
 
-    vat_column = company_columns.get("vat")
-    vat_display = (column_map.get(vat_column, {}).get("text") or "").strip()
+    vat_display = (column_map.get(COMPANIES_VAT_COLUMN_ID, {}).get("text") or "").strip()
     vat_key = normalize_vat(vat_display)
+
+    email_display = (column_map.get(COMPANIES_EMAIL_COLUMN_ID, {}).get("text") or "").strip()
+    email_keys = normalize_emails(email_display)
+
+    # Extract contact IDs connected to this company
+    rel_col = column_map.get(COMPANIES_CONTACTS_RELATION_COLUMN_ID, {})
+    contact_ids_raw = rel_col.get("linked_item_ids") or []
+    contact_ids = [int(x) for x in contact_ids_raw if str(x).isdigit()]
+
+    # Collect and select best phone from Contacts
+    phones_to_evaluate = []
+    for cid in contact_ids:
+        p_disp = contact_phones.get(cid, "")
+        p_key = normalize_phone(p_disp)
+        if p_key:
+            phones_to_evaluate.append((cid, p_disp, p_key))
+
+    best_phone = select_best_phone(phones_to_evaluate)
+    if best_phone:
+        phone_source, phone_display, phone_key = best_phone
+    else:
+        phone_source, phone_display, phone_key = None, "", ""
 
     normalized_name = normalize_company_name(name)
 
@@ -539,87 +577,96 @@ def company_from_item(item: Dict[str, Any], company_columns: Dict[str, Optional[
         column_values=column_map,
         vat_display=vat_display,
         vat_key=vat_key,
+        email_display=email_display,
+        email_keys=tuple(email_keys),
+        contact_ids=tuple(contact_ids),
+        phone_source_contact_id=phone_source,
+        phone_display=phone_display,
+        phone_key=phone_key,
         normalized_name=normalized_name,
     )
 
 
-def company_score(record: CompanyRecord, company_columns: Dict[str, Optional[str]]) -> int:
+def company_score(record: CompanyRecord) -> int:
+    """Score indicates how many identifiers are filled (0 to 3 max)."""
     score = 0
-    if record.vat_display:
-        score += 2
-    if record.display(company_columns.get("country")):
+    if record.vat_key:
         score += 1
-    if record.display(company_columns.get("email")):
+    if record.email_keys:
         score += 1
-    if record.display(company_columns.get("address")):
-        score += 1
-
-    status_value = record.display(company_columns.get("status")).upper()
-    if status_value in STATUS_ACTIVE_VALUES:
+    if record.phone_key:
         score += 1
     return score
 
 
-def select_canonical(records: Sequence[CompanyRecord], company_columns: Dict[str, Optional[str]]) -> CompanyRecord:
+def select_canonical(records: Sequence[CompanyRecord]) -> CompanyRecord:
     def sort_key(record: CompanyRecord) -> Tuple[int, dt.datetime, int]:
-        return (-company_score(record, company_columns), record.created_at_dt, record.id)
+        # High score -> Older creation date -> Smallest ID
+        return (-company_score(record), record.created_at_dt, record.id)
 
     return sorted(records, key=sort_key)[0]
 
 
-def build_duplicate_groups(
-    companies: Sequence[CompanyRecord],
-    company_columns: Dict[str, Optional[str]],
-) -> List[DuplicateGroup]:
-    vat_groups: Dict[str, List[CompanyRecord]] = {}
-    name_groups: Dict[str, List[CompanyRecord]] = {}
+def build_duplicate_groups(companies: Sequence[CompanyRecord]) -> List[DuplicateGroup]:
+    uf = UnionFind()
+    key_to_ids: Dict[str, List[int]] = {}
 
+    # Map each populated identifier key to the list of corresponding company IDs.
     for company in companies:
+        keys = []
         if company.vat_key:
-            vat_groups.setdefault(company.vat_key, []).append(company)
-            continue
+            keys.append(f"VAT:{company.vat_key}")
+        for email in company.email_keys:
+            keys.append(f"EMAIL:{email}")
+        if company.phone_key:
+            keys.append(f"PHONE:{company.phone_key}")
         if company.normalized_name:
-            name_groups.setdefault(company.normalized_name, []).append(company)
+            keys.append(f"NAME:{company.normalized_name}")
+
+        for k in keys:
+            key_to_ids.setdefault(k, []).append(company.id)
+
+    # Union all companies sharing the same key.
+    for ids in key_to_ids.values():
+        if len(ids) > 1:
+            first = ids[0]
+            for other in ids[1:]:
+                uf.union(first, other)
+
+    # Group records by their UF root.
+    clusters: Dict[int, List[CompanyRecord]] = {}
+    for company in companies:
+        root = uf.find(company.id)
+        clusters.setdefault(root, []).append(company)
 
     groups: List[DuplicateGroup] = []
-
-    for vat_key, records in vat_groups.items():
+    for root, records in clusters.items():
         if len(records) < 2:
             continue
-        canonical = select_canonical(records, company_columns)
-        duplicate_ids = tuple(sorted(record.id for record in records if record.id != canonical.id))
-        if not duplicate_ids:
-            continue
-        all_ids = tuple(sorted(record.id for record in records))
+
+        # Compile debug strings of matching keys.
+        cluster_ids = {r.id for r in records}
+        matched_keys = []
+        for k, ids_list in key_to_ids.items():
+            intersect = cluster_ids.intersection(ids_list)
+            if len(intersect) > 1:
+                matched_keys.append(k)
+
+        canonical = select_canonical(records)
+        duplicate_ids = tuple(sorted(r.id for r in records if r.id != canonical.id))
+        all_ids = tuple(sorted(r.id for r in records))
+
         groups.append(
             DuplicateGroup(
-                key_type="VAT",
-                key_value=vat_key,
+                matched_keys=tuple(sorted(matched_keys)),
                 canonical_id=canonical.id,
                 duplicate_ids=duplicate_ids,
                 all_ids=all_ids,
             )
         )
 
-    for normalized_name, records in name_groups.items():
-        if len(records) < 2:
-            continue
-        canonical = select_canonical(records, company_columns)
-        duplicate_ids = tuple(sorted(record.id for record in records if record.id != canonical.id))
-        if not duplicate_ids:
-            continue
-        all_ids = tuple(sorted(record.id for record in records))
-        groups.append(
-            DuplicateGroup(
-                key_type="NAME",
-                key_value=normalized_name,
-                canonical_id=canonical.id,
-                duplicate_ids=duplicate_ids,
-                all_ids=all_ids,
-            )
-        )
-
-    return sorted(groups, key=lambda group: (group.key_type, group.key_value, group.canonical_id))
+    # Return groups sorted deterministically
+    return sorted(groups, key=lambda group: group.canonical_id)
 
 
 def parse_relation_ids(raw_value: Optional[str], context: str) -> List[int]:
@@ -792,24 +839,21 @@ def build_duplicate_map(groups: Sequence[DuplicateGroup]) -> Dict[int, int]:
     return duplicate_to_canonical
 
 
-def safe_get(record: CompanyRecord, column_id: Optional[str]) -> str:
-    return record.display(column_id) if column_id else ""
-
-
 def build_company_index(companies: Sequence[CompanyRecord]) -> Dict[int, CompanyRecord]:
     return {company.id: company for company in companies}
 
 
-def score_snapshot(record: CompanyRecord, company_columns: Dict[str, Optional[str]]) -> Dict[str, Any]:
+def score_snapshot(record: CompanyRecord) -> Dict[str, Any]:
     return {
         "company_id": record.id,
         "name": record.name,
-        "score": company_score(record, company_columns),
+        "score": company_score(record),
         "vat": record.vat_display,
-        "country": safe_get(record, company_columns.get("country")),
-        "email": safe_get(record, company_columns.get("email")),
-        "address": safe_get(record, company_columns.get("address")),
-        "status": safe_get(record, company_columns.get("status")),
+        "email": record.email_display,
+        "contact_ids": list(record.contact_ids),
+        "phone_source_contact_id": record.phone_source_contact_id,
+        "phone_display": record.phone_display,
+        "phone_key": record.phone_key,
         "created_at": record.created_at,
     }
 
@@ -833,8 +877,15 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
         "boards": {
             "companies_board_id": args.companies_board_id,
             "orders_board_id": args.orders_board_id,
+            "contacts_board_id": args.contacts_board_id,
         },
         "relation_columns": list(RELATION_COLUMNS),
+        "hardcoded_columns": {
+            "vat": COMPANIES_VAT_COLUMN_ID,
+            "email": COMPANIES_EMAIL_COLUMN_ID,
+            "contacts_relation": COMPANIES_CONTACTS_RELATION_COLUMN_ID,
+            "contact_phone": CONTACT_PHONE_COLUMN_ID,
+        },
         "assumptions": {
             "single_select_relations_required": True,
             "read_human_values_from_text": True,
@@ -842,50 +893,75 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
         },
     }
 
-    company_columns_meta = fetch_board_columns(client, args.companies_board_id)
     order_columns_meta = fetch_board_columns(client, args.orders_board_id)
     check_relation_columns_are_single_select(order_columns_meta)
 
-    company_columns = resolve_company_columns(
-        columns=company_columns_meta,
-        vat_column_id=args.vat_column_id,
-        country_column_id=args.country_column_id,
-        email_column_id=args.email_column_id,
-        address_column_id=args.address_column_id,
-        status_column_id=args.status_column_id,
+    # 1. Fetch Contact Board Phones
+    contact_items_raw = fetch_all_items(
+        client=client,
+        board_id=args.contacts_board_id,
+        column_ids=[CONTACT_PHONE_COLUMN_ID],
+        page_limit=args.page_limit,
     )
-    if not company_columns.get("vat") and not args.allow_missing_vat_column:
-        raise SafetyCheckError(
-            "VAT column could not be resolved safely. "
-            "Provide --vat-column-id explicitly, or pass --allow-missing-vat-column "
-            "to force name-only deduplication."
-        )
-    report["selected_company_columns"] = company_columns
+    contact_phones = {}
+    for c_item in contact_items_raw:
+        c_id = int(str(c_item.get("id", "0")))
+        c_col_map = as_column_map(c_item)
+        p_disp = extract_phone_from_column(c_col_map.get(CONTACT_PHONE_COLUMN_ID, {}))
+        contact_phones[c_id] = p_disp
 
-    company_column_ids_to_fetch = sorted({cid for cid in company_columns.values() if cid})
-    company_column_ids_to_fetch = sorted(set(company_column_ids_to_fetch + ["text_mknrvv8q"]))
+    # 2. Fetch Companies Data
+    company_column_ids_to_fetch = [
+        COMPANIES_VAT_COLUMN_ID,
+        COMPANIES_EMAIL_COLUMN_ID,
+        COMPANIES_CONTACTS_RELATION_COLUMN_ID,
+    ]
+
     company_items_raw = fetch_all_items(
         client=client,
         board_id=args.companies_board_id,
         column_ids=company_column_ids_to_fetch,
         page_limit=args.page_limit,
     )
-    companies = [company_from_item(item, company_columns) for item in company_items_raw]
+
+    # 3. Assemble and calculate Companies (with phone mapping)
+    companies = [company_from_item(item, contact_phones) for item in company_items_raw]
     company_by_id = build_company_index(companies)
 
-    duplicate_groups = build_duplicate_groups(companies, company_columns)
+    duplicate_groups_all = build_duplicate_groups(companies)
+    duplicate_groups_total_found = len(duplicate_groups_all)
+
+    # 4. Apply Limit logic
+    is_limited = args.max_duplicate_groups > 0 and duplicate_groups_total_found > args.max_duplicate_groups
+    
+    if args.max_duplicate_groups > 0:
+        duplicate_groups = duplicate_groups_all[:args.max_duplicate_groups]
+    else:
+        duplicate_groups = duplicate_groups_all
+        
+    duplicate_groups_processed = len(duplicate_groups)
+
+    report["limits"] = {
+        "max_duplicate_groups": args.max_duplicate_groups,
+        "duplicate_groups_total_found": duplicate_groups_total_found,
+        "duplicate_groups_processed": duplicate_groups_processed,
+        "is_limited": is_limited
+    }
+
+    if args.mode == "execute" and is_limited:
+        report["warning"] = f"Execution is limited to {args.max_duplicate_groups} duplicate groups. Not all duplicates will be processed."
+
     duplicate_to_canonical = build_duplicate_map(duplicate_groups)
     duplicate_ids = sorted(duplicate_to_canonical.keys())
 
     report["duplicate_groups"] = [
         {
-            "key_type": group.key_type,
-            "key_value": group.key_value,
+            "matched_keys": list(group.matched_keys),
             "canonical_id": group.canonical_id,
             "duplicate_ids": list(group.duplicate_ids),
             "all_ids": list(group.all_ids),
             "candidates": [
-                score_snapshot(company_by_id[item_id], company_columns)
+                score_snapshot(company_by_id[item_id])
                 for item_id in sorted(group.all_ids)
                 if item_id in company_by_id
             ],
@@ -900,6 +976,28 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
         page_limit=args.page_limit,
     )
     migration_actions, affected_orders_by_duplicate = plan_relation_migration(order_items_raw, duplicate_to_canonical)
+
+    # Calculate additional counts
+    companies_items_total_analyzed = len(companies)
+    companies_duplicate_items_identified = len(duplicate_ids)
+    companies_items_in_duplicate_groups = sum(len(g.all_ids) for g in duplicate_groups)
+    companies_duplicate_ratio = round(companies_duplicate_items_identified / companies_items_total_analyzed, 6) if companies_items_total_analyzed > 0 else 0.0
+    orders_items_total_analyzed = len(order_items_raw)
+
+    report["analysis_counts"] = {
+        "companies_items_total_analyzed": companies_items_total_analyzed,
+        "companies_duplicate_items_identified": companies_duplicate_items_identified,
+        "companies_items_in_duplicate_groups": companies_items_in_duplicate_groups,
+        "companies_duplicate_ratio": companies_duplicate_ratio,
+        "orders_items_total_analyzed": orders_items_total_analyzed
+    }
+
+    # Identify Unique Affected Orders
+    affected_order_ids_unique = sorted(list(set(action.order_id for action in migration_actions)))
+    report["affected_orders"] = {
+        "unique_order_ids_count": len(affected_order_ids_unique),
+        "unique_order_ids": affected_order_ids_unique
+    }
 
     dry_run_rows = []
     for duplicate_id in duplicate_ids:
@@ -988,22 +1086,19 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
     parser.add_argument("--companies-board-id", type=int, default=COMPANIES_BOARD_ID)
     parser.add_argument("--orders-board-id", type=int, default=ORDERS_BOARD_ID)
-
-    parser.add_argument("--vat-column-id", default=None, help="Optional explicit VAT column id on Companies board.")
-    parser.add_argument("--country-column-id", default=None, help="Optional explicit country column id.")
-    parser.add_argument("--email-column-id", default=None, help="Optional explicit email column id.")
-    parser.add_argument("--address-column-id", default=None, help="Optional explicit address column id.")
-    parser.add_argument("--status-column-id", default=None, help="Optional explicit status column id.")
-    parser.add_argument(
-        "--allow-missing-vat-column",
-        action="store_true",
-        help="Allow name-only dedup when VAT column cannot be resolved. Disabled by default for safety.",
-    )
+    parser.add_argument("--contacts-board-id", type=int, default=CONTACTS_BOARD_ID)
 
     parser.add_argument("--page-limit", type=int, default=500)
     parser.add_argument("--max-retries", type=int, default=5)
     parser.add_argument("--backoff-seconds", type=float, default=1.0)
     parser.add_argument("--timeout-seconds", type=float, default=60.0)
+    
+    parser.add_argument(
+        "--max-duplicate-groups",
+        type=int,
+        default=0,
+        help="Maximum number of duplicate groups to process (0 = unlimited).",
+    )
 
     parser.add_argument(
         "--archive-duplicates",
