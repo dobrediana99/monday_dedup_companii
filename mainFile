@@ -12,7 +12,7 @@ Relations on Board B:
 
 Execution modes:
   1) dry-run  -> no mutations, produces impact report
-  2) execute  -> migrates relations, verifies, archives duplicates
+  2) execute  -> migrates relations, verifies, deletes duplicates
 
 Usage examples:
   export MONDAY_API_TOKEN="..."
@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import difflib
 import json
 import os
 import re
@@ -347,9 +348,9 @@ mutation ChangeRelation($boardId: ID!, $itemId: ID!, $columnId: String!, $value:
 }
 """
 
-ARCHIVE_ITEM_MUTATION = """
-mutation ArchiveItem($itemId: ID!) {
-  archive_item(item_id: $itemId) {
+DELETE_ITEM_MUTATION = """
+mutation DeleteItem($itemId: ID!) {
+  delete_item(item_id: $itemId) {
     id
   }
 }
@@ -468,6 +469,13 @@ def parse_datetime(value: str) -> dt.datetime:
 
 def compact_json(value: Any) -> str:
     return json.dumps(value, separators=(",", ":"), ensure_ascii=True)
+
+
+def name_similarity(a: str, b: str) -> float:
+    """Returns sequence match ratio for two strings. 0.0 if either is empty."""
+    if not a or not b:
+        return 0.0
+    return difflib.SequenceMatcher(None, a, b).ratio()
 
 
 def fetch_board_columns(client: MondayClient, board_id: int) -> List[ColumnMeta]:
@@ -607,31 +615,65 @@ def select_canonical(records: Sequence[CompanyRecord]) -> CompanyRecord:
     return sorted(records, key=sort_key)[0]
 
 
-def build_duplicate_groups(companies: Sequence[CompanyRecord]) -> List[DuplicateGroup]:
+def build_duplicate_groups(
+    companies: Sequence[CompanyRecord],
+    name_sim_threshold: float
+) -> Tuple[List[DuplicateGroup], Dict[str, Any]]:
     uf = UnionFind()
-    key_to_ids: Dict[str, List[int]] = {}
 
-    # Map each populated identifier key to the list of corresponding company IDs.
-    for company in companies:
-        keys = []
-        if company.vat_key:
-            keys.append(f"VAT:{company.vat_key}")
-        for email in company.email_keys:
-            keys.append(f"EMAIL:{email}")
-        if company.phone_key:
-            keys.append(f"PHONE:{company.phone_key}")
-        if company.normalized_name:
-            keys.append(f"NAME:{company.normalized_name}")
+    vat_buckets: Dict[str, List[CompanyRecord]] = {}
+    phone_buckets: Dict[str, List[CompanyRecord]] = {}
+    email_buckets: Dict[str, List[CompanyRecord]] = {}
 
-        for k in keys:
-            key_to_ids.setdefault(k, []).append(company.id)
+    for c in companies:
+        if c.vat_key:
+            vat_buckets.setdefault(c.vat_key, []).append(c)
+        if c.phone_key:
+            phone_buckets.setdefault(c.phone_key, []).append(c)
+        for email in c.email_keys:
+            email_buckets.setdefault(email, []).append(c)
 
-    # Union all companies sharing the same key.
-    for ids in key_to_ids.values():
-        if len(ids) > 1:
-            first = ids[0]
-            for other in ids[1:]:
-                uf.union(first, other)
+    stats = {
+        "name_similarity_threshold": name_sim_threshold,
+        "pairs_evaluated": 0,
+        "pairs_accepted": 0,
+        "pairs_rejected_name_below_threshold": 0,
+        "pairs_by_signal": {
+            "VAT": {"pairs_evaluated": 0, "accepted": 0, "rejected": 0},
+            "PHONE": {"pairs_evaluated": 0, "accepted": 0, "rejected": 0},
+            "EMAIL": {"pairs_evaluated": 0, "accepted": 0, "rejected": 0},
+        }
+    }
+
+    # Tracking explicitly accepted edges to populate `matched_keys`
+    accepted_edges: List[Tuple[int, int, str]] = []
+
+    def process_buckets(buckets: Dict[str, List[CompanyRecord]], signal_name: str) -> None:
+        for key_val, records in buckets.items():
+            if len(records) < 2:
+                continue
+            records_sorted = sorted(records, key=lambda r: r.id)
+            for i in range(len(records_sorted)):
+                for j in range(i + 1, len(records_sorted)):
+                    c1 = records_sorted[i]
+                    c2 = records_sorted[j]
+                    
+                    stats["pairs_evaluated"] += 1
+                    stats["pairs_by_signal"][signal_name]["pairs_evaluated"] += 1
+
+                    sim = name_similarity(c1.normalized_name, c2.normalized_name)
+                    if sim >= name_sim_threshold:
+                        uf.union(c1.id, c2.id)
+                        stats["pairs_accepted"] += 1
+                        stats["pairs_by_signal"][signal_name]["accepted"] += 1
+                        accepted_edges.append((c1.id, c2.id, f"{signal_name}:{key_val}"))
+                    else:
+                        stats["pairs_rejected_name_below_threshold"] += 1
+                        stats["pairs_by_signal"][signal_name]["rejected"] += 1
+
+    process_buckets(vat_buckets, "VAT")
+    process_buckets(phone_buckets, "PHONE")
+    process_buckets(email_buckets, "EMAIL")
 
     # Group records by their UF root.
     clusters: Dict[int, List[CompanyRecord]] = {}
@@ -644,13 +686,13 @@ def build_duplicate_groups(companies: Sequence[CompanyRecord]) -> List[Duplicate
         if len(records) < 2:
             continue
 
-        # Compile debug strings of matching keys.
         cluster_ids = {r.id for r in records}
-        matched_keys = []
-        for k, ids_list in key_to_ids.items():
-            intersect = cluster_ids.intersection(ids_list)
-            if len(intersect) > 1:
-                matched_keys.append(k)
+        matched_keys_set = set()
+        
+        # Attribute edges that belong entirely to this validated cluster
+        for u, v, edge_key in accepted_edges:
+            if u in cluster_ids:
+                matched_keys_set.add(edge_key)
 
         canonical = select_canonical(records)
         duplicate_ids = tuple(sorted(r.id for r in records if r.id != canonical.id))
@@ -658,7 +700,7 @@ def build_duplicate_groups(companies: Sequence[CompanyRecord]) -> List[Duplicate
 
         groups.append(
             DuplicateGroup(
-                matched_keys=tuple(sorted(matched_keys)),
+                matched_keys=tuple(sorted(matched_keys_set)),
                 canonical_id=canonical.id,
                 duplicate_ids=duplicate_ids,
                 all_ids=all_ids,
@@ -666,7 +708,7 @@ def build_duplicate_groups(companies: Sequence[CompanyRecord]) -> List[Duplicate
         )
 
     # Return groups sorted deterministically
-    return sorted(groups, key=lambda group: group.canonical_id)
+    return sorted(groups, key=lambda group: group.canonical_id), stats
 
 
 def parse_relation_ids(raw_value: Optional[str], context: str) -> List[int]:
@@ -823,12 +865,12 @@ def verify_no_duplicate_references(
     return leftovers
 
 
-def archive_duplicates(client: MondayClient, duplicate_ids: Sequence[int]) -> List[int]:
-    archived: List[int] = []
+def delete_duplicates(client: MondayClient, duplicate_ids: Sequence[int]) -> List[int]:
+    deleted: List[int] = []
     for duplicate_id in sorted(set(duplicate_ids)):
-        client.execute(ARCHIVE_ITEM_MUTATION, {"itemId": str(duplicate_id)})
-        archived.append(duplicate_id)
-    return archived
+        client.execute(DELETE_ITEM_MUTATION, {"itemId": str(duplicate_id)})
+        deleted.append(duplicate_id)
+    return deleted
 
 
 def build_duplicate_map(groups: Sequence[DuplicateGroup]) -> Dict[int, int]:
@@ -890,6 +932,7 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
             "single_select_relations_required": True,
             "read_human_values_from_text": True,
             "update_relations_with_linkedPulseIds_json_string": True,
+            "name_similarity_threshold": args.name_sim_threshold,
         },
     }
 
@@ -928,8 +971,10 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
     companies = [company_from_item(item, contact_phones) for item in company_items_raw]
     company_by_id = build_company_index(companies)
 
-    duplicate_groups_all = build_duplicate_groups(companies)
+    duplicate_groups_all, dedup_stats = build_duplicate_groups(companies, args.name_sim_threshold)
     duplicate_groups_total_found = len(duplicate_groups_all)
+    
+    report["dedup_stats"] = dedup_stats
 
     # 4. Apply Limit logic
     is_limited = args.max_duplicate_groups > 0 and duplicate_groups_total_found > args.max_duplicate_groups
@@ -1028,13 +1073,13 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
             "passed": None,
             "remaining_references": [],
         }
-        report["archived_duplicates"] = []
+        report["deleted_duplicates"] = []
         report["summary"] = {
             "duplicate_groups_count": len(duplicate_groups),
             "duplicate_items_count": len(duplicate_ids),
             "orders_to_update_count": len(migration_actions),
             "mutations_executed": 0,
-            "archives_executed": 0,
+            "deletes_executed": 0,
         }
         return report
 
@@ -1061,19 +1106,19 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
     if remaining_references:
         raise SafetyCheckError(
             "Verification failed: duplicate references still exist in orders board. "
-            "Archiving is blocked to prevent relation loss."
+            "Deleting is blocked to prevent relation loss."
         )
 
-    archived_duplicates = []
-    if args.archive_duplicates:
-        archived_duplicates = archive_duplicates(client, duplicate_ids)
-    report["archived_duplicates"] = archived_duplicates
+    deleted_duplicates = []
+    if args.delete_duplicates:
+        deleted_duplicates = delete_duplicates(client, duplicate_ids)
+    report["deleted_duplicates"] = deleted_duplicates
     report["summary"] = {
         "duplicate_groups_count": len(duplicate_groups),
         "duplicate_items_count": len(duplicate_ids),
         "orders_to_update_count": len(migration_actions),
         "mutations_executed": len(relation_update_log),
-        "archives_executed": len(archived_duplicates),
+        "deletes_executed": len(deleted_duplicates),
     }
     return report
 
@@ -1099,12 +1144,19 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=0,
         help="Maximum number of duplicate groups to process (0 = unlimited).",
     )
+    
+    parser.add_argument(
+        "--name-sim-threshold",
+        type=float,
+        default=0.92,
+        help="Minimum sequence match ratio (0.0 to 1.0) for company names to merge on matching VAT/Phone/Email.",
+    )
 
     parser.add_argument(
-        "--archive-duplicates",
+        "--delete-duplicates",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="Archive duplicates after verification in execute mode.",
+        help="Delete duplicates after verification in execute mode.",
     )
     return parser
 
